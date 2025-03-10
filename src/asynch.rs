@@ -19,9 +19,12 @@ where
     fn handle(&mut self, msg: M) -> impl std::future::Future<Output = R> + Send;
 }
 
-#[async_trait]
 pub trait AsyncChannelHandler<M, R> {
-    async fn handle(&mut self, msg: M, sender: &Sender<R>);
+    fn handle(
+        &mut self,
+        msg: M,
+        sender: &Sender<R>,
+    ) -> impl std::future::Future<Output = ()> + Send;
 }
 
 #[derive(Clone)]
@@ -71,7 +74,7 @@ impl<A: Actor + Send + 'static> Context<A> {
         R: Send + 'static,
         A: AsyncChannelHandler<M, R>,
     {
-        let (send, receiv) = channel(10);
+        let (send, receiv) = channel(1);
         let proxy: AsyncChannelEnveloppeProxy<M, R> = AsyncChannelEnveloppeProxy {
             msg: Some(msg),
             sender: send,
@@ -195,7 +198,6 @@ mod test {
         struct Repeater;
         impl Actor for Repeater {}
 
-        #[async_trait]
         impl AsyncChannelHandler<Repeat, String> for Repeater {
             async fn handle(&mut self, msg: Repeat, sender: &Sender<String>) {
                 for _ in 0..msg.number {
