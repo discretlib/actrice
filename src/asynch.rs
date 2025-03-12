@@ -1,14 +1,13 @@
-use std::sync::{Arc, Mutex};
-
 use crate::Receiver;
 use crate::Sender;
 use crate::channel;
 use async_trait::async_trait;
-use tokio::sync::Notify;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 pub trait Actor: Sized + Send + 'static {
-    fn start(self) -> Context<Self> {
-        Context::new(self)
+    fn start(self) -> Adress<Self> {
+        Adress::new(self)
     }
 }
 
@@ -28,47 +27,58 @@ pub trait AsyncChannelHandler<M, R> {
 }
 
 #[derive(Clone)]
-pub struct Context<A>
+pub struct Adress<A>
 where
     A: Actor + Send + 'static,
 {
-    sender: Sender<Enveloppe<A>>,
+    sender: mpsc::Sender<Enveloppe<A>>,
 }
-impl<A: Actor + Send + 'static> Context<A> {
-    fn new(mut act: A) -> Context<A> {
-        let (sender, receiv) = channel::<Enveloppe<A>>(1);
+impl<A: Actor + Send + 'static> Adress<A> {
+    fn new(mut act: A) -> Adress<A> {
+        let (sender, mut receiv) = mpsc::channel::<Enveloppe<A>>(1);
 
         tokio::spawn(async move {
-            while let Ok(fun) = receiv.recv_async().await {
+            while let Some(fun) = receiv.recv().await {
                 let mut message = fun.0;
                 message.handle(&mut act).await;
             }
         });
 
-        Context { sender }
+        Adress { sender }
     }
 
-    pub async fn send<M, R>(&self, msg: M) -> R
+    pub async fn send<M, R>(&self, msg: M)
     where
         M: Send + 'static,
         R: Send + 'static,
         A: AsyncHandler<M, R>,
     {
-        let send_result: Arc<SendResult<R>> = SendResult::new();
+        // let send_result: Arc<SendResult<R>> = SendResult::new();
         let proxy: AsyncEnveloppeProxy<M, R> = AsyncEnveloppeProxy {
             msg: Some(msg),
-            result: send_result.clone(),
+            sender: None, // send_result.clone(),
         };
 
-        self.sender
-            .send_async(Enveloppe(Box::new(proxy)))
-            .await
-            .unwrap();
-        send_result.notify.notified().await;
-        send_result.value.lock().unwrap().take().unwrap()
+        self.sender.send(Enveloppe(Box::new(proxy))).await.unwrap();
     }
 
-    pub async fn send_with_channel<M, R>(&self, msg: M) -> Receiver<R>
+    pub async fn ask<M, R>(&self, msg: M) -> R
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+        A: AsyncHandler<M, R>,
+    {
+        let (tx, rx) = oneshot::channel();
+        let proxy: AsyncEnveloppeProxy<M, R> = AsyncEnveloppeProxy {
+            msg: Some(msg),
+            sender: Some(tx), // send_result.clone(),
+        };
+
+        self.sender.send(Enveloppe(Box::new(proxy))).await.unwrap();
+        rx.await.unwrap()
+    }
+
+    pub async fn ask_channel<M, R>(&self, msg: M) -> Receiver<R>
     where
         M: Send + 'static,
         R: Send + 'static,
@@ -79,14 +89,11 @@ impl<A: Actor + Send + 'static> Context<A> {
             msg: Some(msg),
             sender: send,
         };
-        self.sender
-            .send_async(Enveloppe(Box::new(proxy)))
-            .await
-            .unwrap();
+        self.sender.send(Enveloppe(Box::new(proxy))).await.unwrap();
         receiv
     }
 
-    pub async fn send_with_provided_channel<M, R>(&self, msg: M, sender: Sender<R>)
+    pub async fn ask_with<M, R>(&self, msg: M, sender: Sender<R>)
     where
         M: Send + 'static,
         R: Send + 'static,
@@ -96,10 +103,7 @@ impl<A: Actor + Send + 'static> Context<A> {
             msg: Some(msg),
             sender,
         };
-        self.sender
-            .send_async(Enveloppe(Box::new(proxy)))
-            .await
-            .unwrap();
+        self.sender.send(Enveloppe(Box::new(proxy))).await.unwrap();
     }
 }
 
@@ -110,27 +114,13 @@ trait EnveloppeProxy<A> {
     async fn handle(&mut self, act: &mut A);
 }
 
-struct SendResult<R> {
-    value: Mutex<Option<R>>,
-    notify: Notify,
-}
-impl<R> SendResult<R> {
-    fn new() -> Arc<SendResult<R>> {
-        let send: SendResult<R> = Self {
-            value: Mutex::new(None),
-            notify: Notify::new(),
-        };
-        Arc::new(send)
-    }
-}
-
 struct AsyncEnveloppeProxy<M, R>
 where
     M: Send + 'static,
     R: Send + 'static,
 {
     msg: Option<M>,
-    result: Arc<SendResult<R>>,
+    sender: Option<oneshot::Sender<R>>,
 }
 #[async_trait]
 impl<A, M, R> EnveloppeProxy<A> for AsyncEnveloppeProxy<M, R>
@@ -141,9 +131,9 @@ where
 {
     async fn handle(&mut self, act: &mut A) {
         let result = act.handle(self.msg.take().unwrap()).await;
-        let mut v = self.result.value.lock().unwrap();
-        *v = Some(result);
-        self.result.notify.notify_one();
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(result);
+        }
     }
 }
 
@@ -172,7 +162,7 @@ mod test {
     use super::*;
 
     #[tokio::test]
-    async fn send() {
+    async fn ask() {
         struct Greeter;
         impl Actor for Greeter {}
 
@@ -183,13 +173,13 @@ mod test {
         }
 
         let ctx = Greeter.start();
-        let res: String = ctx.send("World".to_owned()).await;
+        let res: String = ctx.ask("World".to_owned()).await;
 
         assert_eq!("Hello World", res)
     }
 
     #[tokio::test]
-    async fn send_channel() {
+    async fn ask_channel() {
         struct Repeat {
             value: String,
             number: usize,
@@ -201,7 +191,7 @@ mod test {
         impl AsyncChannelHandler<Repeat, String> for Repeater {
             async fn handle(&mut self, msg: Repeat, sender: &Sender<String>) {
                 for _ in 0..msg.number {
-                    sender.send_async(msg.value.to_owned()).await.unwrap();
+                    sender.send(msg.value.to_owned()).await;
                 }
             }
         }
@@ -210,19 +200,19 @@ mod test {
         let number = 10;
 
         let chan = ctx
-            .send_with_channel(Repeat {
+            .ask_channel(Repeat {
                 value: "Hello World".to_owned(),
                 number: number,
             })
             .await;
         let mut expected = 0;
-        while let Ok(_) = chan.recv_async().await {
+        while let Some(_) = chan.recv().await {
             expected += 1;
         }
         assert_eq!(number, expected);
 
         let (send, receiv) = channel(10);
-        ctx.send_with_provided_channel(
+        ctx.ask_with(
             Repeat {
                 value: "Hello World".to_owned(),
                 number: number,
@@ -231,9 +221,31 @@ mod test {
         )
         .await;
         let mut expected = 0;
-        while let Ok(_) = receiv.recv_async().await {
+        while let Some(_) = receiv.recv().await {
             expected += 1;
         }
         assert_eq!(number, expected);
+    }
+
+    #[tokio::test]
+    async fn send() {
+        struct Greeter {
+            sender: Sender<String>,
+        }
+        impl Actor for Greeter {}
+
+        impl AsyncHandler<String, ()> for Greeter {
+            async fn handle(&mut self, msg: String) -> () {
+                self.sender.send(format!("Hello {msg}")).await
+            }
+        }
+
+        let (sender, receiver) = channel(1);
+        let greeter = Greeter { sender };
+        let ctx = greeter.start();
+        ctx.send("World".to_owned()).await;
+        if let Some(res) = receiver.recv().await {
+            assert_eq!("Hello World", res)
+        }
     }
 }
